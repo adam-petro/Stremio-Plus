@@ -19,7 +19,7 @@ enum Row {
     SubBackground, SubColor, SubEffect, SubFont, SubDelay,
     AudioLangs, Autoplay, NextEpisodeDelay, SeekStep, ShoulderSeekStep, Resolution, ReducedMotion, Contrast,
     ControllerLight, Sounds, Volume, Statistics, Addons, Reload, Exit,
-    AudioPassthrough, DisplayRefresh, Count
+    AudioPassthrough, DisplayRefresh, HdrOutput, DiagServer, Count
 };
 
 struct LanguageChoice { const char* code; const char* italian; const char* english; };
@@ -221,14 +221,22 @@ void App::settings_refresh() {
     row(Reload, "reload", t("Aggiorna add-on e cataloghi", "Refresh add-ons and catalogs"), "");
     row(Exit, "exit", t("Esci da Stremio", "Exit Stremio"), "");
     row(AudioPassthrough, "audio_passthrough", "Audio passthrough",
-        t("Invia i formati audio compatibili al ricevitore HDMI. Se non disponibile, usa PCM. Si applica al prossimo video.",
-          "Send supported audio formats to the HDMI receiver. Use PCM when unavailable. Applies to the next video."));
+        t("Invia Dolby Digital, Dolby Digital Plus, DTS e Dolby TrueHD (Atmos compreso) al ricevitore HDMI come bitstream originale. PCM se il ricevitore non elenca il formato. Si applica al prossimo video.",
+          "Send Dolby Digital, Dolby Digital Plus, DTS and Dolby TrueHD (Atmos included) to the HDMI receiver as the original bitstream. PCM when the receiver does not list the format. Applies to the next video."));
     toggle(AudioPassthrough, settings_.audio_passthrough);
     row(DisplayRefresh, "display_refresh", t("Uscita 120 Hz", "120 Hz output"),
         t("Automatico abilita l'uscita ad alta frequenza quando supportata. Solo riproduzione ripristina la frequenza di sistema nei menu.",
           "Auto enables supported high refresh output. Playback only restores the system refresh rate in menus."));
     choice(DisplayRefresh, {t("Disattivata", "Off"), t("Automatico", "Auto"), t("Solo riproduzione", "Playback only")},
         settings_.display_refresh);
+    row(HdrOutput, "hdr_output", t("Uscita HDR", "HDR output"),
+        t("Passa la console in HDR10 mentre un video HDR10, HLG o Dolby Vision (profilo 7 o 8) è in riproduzione su uno schermo HDR. Richiede l'impostazione PS5 HDR: Attivo quando supportato.",
+          "Switches the console to HDR10 while an HDR10, HLG or Dolby Vision (profile 7 or 8) video plays on an HDR display. Needs the PS5 setting HDR: On When Supported."));
+    toggle(HdrOutput, settings_.hdr_output);
+    row(DiagServer, "diagnostics_server", t("Server di diagnostica", "Diagnostics server"),
+        t("Pubblica il registro dell'app via HTTP sulla porta 9029, per i test da un computer sulla stessa rete. Nessuna autenticazione: solo in casa.",
+          "Serves the app log over HTTP on port 9029, for testing from a computer on the same network. No authentication: home networks only."));
+    toggle(DiagServer, settings_.diagnostics_server);
     s_sel = std::clamp(s_sel, 0, Count - 1);
     dirty_all();
 }
@@ -265,6 +273,8 @@ void App::set_setting_value(int row, float value) {
     case Statistics: settings_.show_stats = n != 0; break;
     case AudioPassthrough: settings_.audio_passthrough = n != 0; break;
     case DisplayRefresh: settings_.display_refresh = std::clamp(n, 0, 2); break;
+    case HdrOutput: settings_.hdr_output = n != 0; break;
+    case DiagServer: settings_.diagnostics_server = n != 0; break;
     default: return;
     }
     save_settings(); settings_refresh();

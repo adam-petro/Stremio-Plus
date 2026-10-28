@@ -50,6 +50,7 @@ constexpr const char* kNativeAudioShutdownError =
     "The native audio output could not be released safely. Playback has been stopped.";
 #endif
 std::atomic<int> hardware_decoders{0};
+std::atomic<unsigned> dolby_vision_profile{0};  // from ps5vdec: 7 or 8 when its HDR10 base layer plays
 std::atomic<bool> hardware_failed{false};
 
 bool regular_local_file(std::string path) {
@@ -764,6 +765,8 @@ struct Player::Vlc {
                 frame_rate = video.i_frame_rate_den ? double(video.i_frame_rate_num) / video.i_frame_rate_den : 0;
                 codecs.push_back(name + " " + std::to_string(video.i_width) + "x" + std::to_string(video.i_height) +
                     (hardware_decoders > 0 ? " (PS5 hardware)" : " (software)"));
+                if (const unsigned dv = dolby_vision_profile.load())
+                    codecs.push_back("Dolby Vision profile " + std::to_string(dv) + ": HDR10 base layer");
             }
         }
         if (tracks) libvlc_media_tracks_release(tracks, count);
@@ -1148,6 +1151,7 @@ void Player::open(const Options& options) {
     if (progressive_download()) opts_.start = std::min(opts_.start, opts_.progressive_resume_limit);
     duration_ = 0; paused_ = false; too_heavy_ = false; audio_stream_ = -1;
     hardware_failed = false;
+    dolby_vision_profile = 0;
     vlc_ = std::make_unique<Vlc>(*this);
     state_ = State::Opening;
     vlc_->worker = std::thread([this] { vlc_->run(); });
@@ -1344,6 +1348,7 @@ void Player::log_stats() {
 extern "C" int vlc_ps5_vdec_available() { return HwDecoder::available() ? 1 : 0; }
 extern "C" void vlc_ps5_vdec_failed() { hardware_failed = true; }
 extern "C" void vlc_ps5_vdec_active(int active) { hardware_decoders.fetch_add(active ? 1 : -1); }
+extern "C" void vlc_ps5_vdec_dolby_vision(unsigned profile) { dolby_vision_profile = profile; }
 
 std::string Player::audio_output_status() const {
     return vlc_ ? vlc_->audio_mode_status.load() : "pcm";

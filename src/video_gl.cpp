@@ -28,7 +28,7 @@ constexpr const char* fragment_begin = R"GLSL(
 in vec2 uv;
 out vec4 color;
 uniform sampler2DRect ytex, utex, vtex;
-uniform int layout_mode, color_mode, wide, sample_shift, full_range, hlg, dovi_active;
+uniform int layout_mode, color_mode, wide, sample_shift, full_range, hlg, dovi_active, hdr_output;
 )GLSL";
 constexpr const char* fragment_end = R"GLSL(
 
@@ -48,6 +48,18 @@ float hlg_linear(float x) {
 vec3 transfer709(vec3 v) {
     v = clamp(v, 0.0, 1.0);
     return mix(1.099 * pow(v, vec3(0.45)) - 0.099, 4.5 * v, lessThan(v, vec3(0.018)));
+}
+// HLG re-coded to PQ for the HDR scan-out (ITU-R BT.2100: scene light, the
+// 1000 cd/m2 OOTF, then PQ), as Sp9nky's port does.
+vec3 hlg_to_pq(vec3 e) {
+    e = clamp(e, 0.0, 1.0);
+    vec3 low = e * e / 3.0;
+    vec3 high = (exp((e - 0.55991073) / 0.17883277) + 0.28466892) / 12.0;
+    vec3 scene = mix(low, high, step(0.5, e));
+    float ys = dot(scene, vec3(0.2627, 0.6780, 0.0593));
+    vec3 display = scene * pow(max(ys, 1e-6), 0.2) * (1000.0 / 10000.0);
+    vec3 p = pow(max(display, vec3(0.0)), vec3(0.1593017578125));
+    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(78.84375));
 }
 void main() {
     // Rectangle planes use texel coordinates. Scale each plane independently:
@@ -71,6 +83,12 @@ void main() {
     if (color_mode == 2 || hlg != 0) rgb = vec3(y + 1.4746*c.y, y - 0.16455*c.x - 0.57135*c.y, y + 1.8814*c.x);
     else if (color_mode == 0) rgb = vec3(y + 1.402*c.y, y - 0.344136*c.x - 0.714136*c.y, y + 1.772*c.x);
     else rgb = vec3(y + 1.5748*c.y, y - 0.187324*c.x - 0.468124*c.y, y + 1.8556*c.x);
+    if (hdr_output != 0 && dovi_active == 0 && (color_mode == 2 || hlg != 0)) {
+        // HDR scan-out: the BT.2020 matrix on PQ-coded components leaves
+        // PQ-coded RGB, so an HDR10 picture passes as it is; HLG is re-coded.
+        color = vec4(hlg != 0 ? hlg_to_pq(rgb) : clamp(rgb, 0.0, 1.0), 1.0);
+        return;
+    }
     if (color_mode == 2 || hlg != 0 || dovi_active != 0) {
         vec3 light = dovi_active != 0 ? dovi_nits(code / maximum) / 100.0 :
             hlg != 0 ? vec3(hlg_linear(rgb.r), hlg_linear(rgb.g), hlg_linear(rgb.b)) : pq(rgb);
@@ -151,9 +169,16 @@ void VideoGl::discard_textures() {
     format_ = -1;
     valid_ = false;
 }
+void VideoGl::set_hdr_output(bool on) {
+    if (hdr_output_ == on) return;
+    hdr_output_ = on;
+    // The output texture's format follows at the next upload.
+    if (source_hdr_) format_ = -1;
+}
 void VideoGl::clear() {
     discard_textures();
     dovi_active_ = false;
+    source_hdr_ = output_pq_ = false;
     stamp_ = period_ = 0;
     previous_media_pts_ = -1;
     serial_ = -1;
@@ -193,7 +218,9 @@ bool VideoGl::upload(const Player::VideoFrame& f) {
     if (f.w <= 0 || f.h <= 0 || f.w > 8192 || f.h > 8192 || !f.data() || !f.size())
         return reject(Failure::InvalidFrame, "frame_descriptor", f);
     const int layout = f.layout == Layout::Bgra ? 0 : f.layout == Layout::Nv12 ? 1 : 2;
-    const int format = layout + (f.wide ? 4 : 0);
+    const bool source_hdr = layout != 0 && (f.colors == YuvColors::Hdr10 || f.hlg) && !f.dovi;
+    const bool ten_bit = hdr_output_ && source_hdr;
+    const int format = layout + (f.wide ? 4 : 0) + (ten_bit ? 8 : 0);
     const int cw = (f.w + 1) / 2, ch = (f.h + 1) / 2;
     const int bytes = f.wide ? 2 : 1;
     const int count = layout == 0 ? 1 : layout == 1 ? 2 : 3;
@@ -241,8 +268,11 @@ bool VideoGl::upload(const Player::VideoFrame& f) {
         };
         // The 4K RGBA target needs a contiguous 32 MiB region aligned to 2 MiB.
         // Allocate it before smaller planes fragment the remaining regions.
-        if (!allocate(output_, GL_TEXTURE_2D, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, f.w, f.h))
+        // 2:10:10:10 for the HDR scan-out: the same 32 bits per pixel.
+        if (!allocate(output_, GL_TEXTURE_2D, ten_bit ? GL_RGB10_A2 : GL_RGBA8, GL_RGBA,
+                      ten_bit ? GL_UNSIGNED_INT_2_10_10_10_REV : GL_UNSIGNED_BYTE, f.w, f.h))
             return failed_setup(Failure::Allocation, "output_storage", -1, allocation_error);
+        output_pq_ = ten_bit;
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, output_, 0);
         const GLenum framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -263,7 +293,8 @@ bool VideoGl::upload(const Player::VideoFrame& f) {
                 return failed_setup(Failure::Allocation, "plane_storage", i, allocation_error);
         }
         width_ = f.w; height_ = f.h; format_ = format;
-        dlog("video: GPU conversion %dx%d, layout=%d, source=%d-bit, output SDR, upload=rectangle", f.w, f.h, layout, f.wide ? 10 : 8);
+        dlog("video: GPU conversion %dx%d, layout=%d, source=%d-bit, output %s, upload=rectangle", f.w, f.h, layout,
+             f.wide ? 10 : 8, ten_bit ? "10-bit PQ (HDR scan-out)" : "SDR");
         upload_timing_.allocation_ms = elapsed_ms(allocation_started);
     }
     const auto planes_started = UploadClock::now();
@@ -295,6 +326,8 @@ bool VideoGl::upload(const Player::VideoFrame& f) {
         glBindBuffer(GL_UNIFORM_BUFFER, 0);
     }
     uniform("color_mode", f.colors == YuvColors::Bt601 ? 0 : f.colors == YuvColors::Hdr10 ? 2 : 1);
+    uniform("hdr_output", ten_bit ? 1 : 0);
+    source_hdr_ = source_hdr;
     glDrawArrays(GL_TRIANGLES, 0, 3);
     upload_timing_.draw_ms = elapsed_ms(draw_started);
     // Cadence is diagnostic only. Rendering always exposes this source-sized

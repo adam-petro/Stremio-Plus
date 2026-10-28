@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+- **Dolby TrueHD passthrough, Atmos included.** Audio passthrough now also
+  sends Dolby TrueHD tracks (48 kHz) to the HDMI receiver, as Dolby MAT
+  frames on the console's system audio port, the route documented by
+  sainsaji's PS5-Audio-Passthrough-Research. A receiver showed "Dolby
+  TrueHD 7.1" on hardware. The EVO-derived packer already built the MAT
+  frames; the output now opens the system port for them and cuts its
+  bursts into whole port grains.
+- **HDR output.** While an HDR10 or HLG video plays on a display whose HDMI
+  link runs in HDR, the console's scan-out switches to 10-bit BT.2020 PQ
+  and the picture goes out as it is instead of being tone mapped to SDR;
+  the interface is composed on top at reference white. The scan-out
+  returns to SDR when the video ends. Settings → HDR output turns it off.
+  The title declares HDR capability (param.json attribute 0x62000000),
+  which the console requires before it accepts the switch. The method is
+  the one Sp9nky's Stremio port, PS5MC and ProsperoLight use.
+- **Dolby Vision profiles 7 and 8 on the hardware decoder.** The decoder
+  reads the profile from the first RPU: profile 5 keeps going to the
+  metadata-aware software decoder, profiles 7 and 8 play their HDR10 base
+  layer on the hardware decoder with the RPU and enhancement layer left
+  out (MKV remuxes included, which arrive as Annex B). The statistics line
+  names the profile.
+- **Fix: the whole-console crash.** A file with embedded cover art made VLC
+  save the art to its cache and call `pathconf`, which only the
+  system-process kernel library exports; a title runs with the plain
+  libkernel, so the import was address 0 and the call jumped to it, and the
+  console's own crash handling then shut the console down. The native
+  build now provides `pathconf`, `fpathconf`, `openat`, `fstatat` and
+  `fork` itself, the import check no longer counts libkernel_sys as
+  loaded, and VLC's cache directory is an absolute path under the app's
+  data folder. The crash handler ends the process with `_exit` after
+  writing its receipt instead of handing the signal back to the console.
+- **Crash receipts you can decode.** `crash-current.txt` /
+  `crash-last.txt` now hold the raw words of the signal context, the
+  return addresses found on the crashed thread's stack, a timestamp and
+  the thread. The console's context layout (a 64-byte signal mask before
+  FreeBSD's mcontext, unlike the SDK's `ucontext_t`) is read correctly.
+- **Diagnostics server.** Settings → Diagnostics server publishes the log
+  over plain HTTP on port 9029 (`/log`, `/log?follow=1`, `/events`,
+  `/status`, `/crash`, `/boot`) for testing from a computer on the same
+  network. Off by default, no authentication.
+
 ## 0.5.20 - 2026-10-24
 
 Changes since 0.5.18.

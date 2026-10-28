@@ -38,6 +38,8 @@ public:
 		int stream = -1;
 		std::string label, lang;
 	};
+	// PS5 HDMI audio: stereo PCM (the previous behaviour), 5.1 / 7.1 PCM, or the
+	// original Dolby / DTS bitstream for the receiver to decode.
 	struct Options {
 		std::string url;
 		std::vector<std::string> headers;

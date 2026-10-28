@@ -25,6 +25,15 @@ public:
     double aspect() const { return aspect_; }
     double fps() const;
     bool dolby_vision_active() const { return dovi_active_; }
+    // HDR scan-out (hdr_out.cpp): an HDR10 or HLG frame is converted to
+    // PQ-coded BT.2020 in a 10-bit texture instead of being tone mapped to
+    // SDR. The next uploaded frame takes the new mode.
+    void set_hdr_output(bool on);
+    // The last uploaded frame was HDR10 or HLG (Dolby Vision profile 5's
+    // reshaped picture is tone mapped as before).
+    bool hdr_source() const { return valid_ && source_hdr_; }
+    // texture() holds PQ codes for the HDR final pass, not an SDR picture.
+    bool hdr_texture() const { return valid_ && output_pq_; }
     Failure last_failure() const { return failure_; }
     const UploadTiming& last_upload_timing() const { return upload_timing_; }
     static constexpr const char* upload_path() { return "rectangle-planes"; }
@@ -37,6 +46,7 @@ private:
     int width_ = 0, height_ = 0, format_ = -1;
     bool valid_ = false;
     bool dovi_active_ = false;
+    bool source_hdr_ = false, hdr_output_ = false, output_pq_ = false;
     double aspect_ = 16.0 / 9.0;
     int serial_ = -1;
     double stamp_ = 0, period_ = 0, previous_media_pts_ = -1;

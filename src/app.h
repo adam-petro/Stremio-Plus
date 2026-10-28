@@ -149,6 +149,8 @@ struct Settings {
 	int display_resolution = -1;  // Automatic (PS5); 0/1/2 are explicit 1080p/1440p/2160p.
 	int display_refresh = 0;  // Off, automatic, playback only.
 	bool audio_passthrough = false;
+	bool hdr_output = true;           // HDR10 scan-out while an HDR video plays (PS5)
+	bool diagnostics_server = false;  // HTTP log server on port 9029, for testing from a computer
 	int date_components = 15;  // Weekday, day, month, year; zero hides the date.
 	std::string date_format = "short";
 	bool controller_ambient_light = true;

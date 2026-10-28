@@ -174,6 +174,7 @@ extern void vlc_ps5_split_plane16(uint8_t *dst_u, size_t u_pitch, uint8_t *dst_v
                                   unsigned rows) __attribute__((weak));
 extern void vlc_ps5_vdec_failed(void) __attribute__((weak));
 extern void vlc_ps5_vdec_active(int on) __attribute__((weak));
+extern void vlc_ps5_vdec_dolby_vision(unsigned profile) __attribute__((weak));
 
 #define PROT_CPU_RW 0x03
 #define PROT_GPU_RW 0x30
@@ -393,6 +394,9 @@ struct decoder_sys_t {
     bool format_set;
     uint32_t out_w, out_h, out_pitch_bytes;
     bool out_ten;
+    unsigned dv_profile;       /* Dolby Vision: 0 none seen, else 5, 7 or 8 */
+    unsigned dv_reported;      /* the last profile handed to the app */
+    bool dv_layer_seen;        /* a unit of another layer (profile 7's enhancement layer) was met */
 };
 
 static void pending_add(decoder_sys_t *sys, mtime_t t)
@@ -417,9 +421,11 @@ static mtime_t pending_take(decoder_sys_t *sys)
     return t;
 }
 
-/* Enhancement layers are not accepted by VideoDec2. RPU units remain long
- * enough to select the metadata-aware software decoder below: Profile 5
- * has no HDR10-compatible base layer and cannot simply discard its RPU. */
+/* Enhancement layers are not accepted by VideoDec2. RPU units (type 62)
+ * remain long enough to read the Dolby Vision profile from the first one:
+ * profile 5 has no HDR10-compatible base layer and goes to the
+ * metadata-aware software decoder; profiles 7 and 8 play their HDR10 base
+ * layer here, with the RPU and the enhancement layer left out. */
 static bool hevc_skip(const uint8_t *nal, size_t n)
 {
     if (n < 2)
@@ -429,13 +435,119 @@ static bool hevc_skip(const uint8_t *nal, size_t n)
     return type == 63 || layer != 0;
 }
 
-static bool hevc_has_rpu(const uint8_t *data, size_t size)
+/* The first RPU unit of an Annex B access unit: its bytes after the start
+ * code, up to the next start code. */
+static const uint8_t *hevc_find_rpu(const uint8_t *data, size_t size, size_t *len)
 {
-    for (size_t i = 0; i + 4 < size; ++i)
-        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 &&
-            ((data[i + 3] >> 1) & 0x3f) == 62)
-            return true;
-    return false;
+    for (size_t i = 0; i + 4 < size; ++i) {
+        if (!(data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1))
+            continue;
+        const uint8_t *nal = data + i + 3;
+        size_t n = size - (i + 3);
+        for (size_t j = 0; j + 3 <= n; ++j)
+            if (nal[j] == 0 && nal[j + 1] == 0 && (nal[j + 2] == 1 || (nal[j + 2] == 0 && j + 3 < n && nal[j + 3] == 1))) {
+                n = j;
+                break;
+            }
+        if (((nal[0] >> 1) & 0x3f) == 62) {
+            *len = n;
+            return nal;
+        }
+    }
+    return NULL;
+}
+
+struct dv_bits { const uint8_t *p; size_t n; size_t pos; };
+
+static unsigned dv_read(struct dv_bits *b, unsigned count)
+{
+    unsigned v = 0;
+    while (count--) {
+        unsigned bit = b->pos < b->n * 8 ? (b->p[b->pos >> 3] >> (7 - (b->pos & 7))) & 1 : 0;
+        b->pos++;
+        v = (v << 1) | bit;
+    }
+    return v;
+}
+
+static unsigned dv_read_ue(struct dv_bits *b)
+{
+    unsigned zeros = 0;
+    while (zeros < 32 && dv_read(b, 1) == 0)
+        zeros++;
+    return (zeros >= 32 ? 0 : (1u << zeros) - 1) + dv_read(b, zeros);
+}
+
+/* Whether an RPU is a profile 5 one, read the way FFmpeg's dovi_rpu.c tells
+ * the profiles apart without a configuration record: RPU profile 0 with a
+ * full-range base layer (the IPT base layer, no HDR10 picture in it). The
+ * NAL header (2 bytes) and rpu_nal_prefix come first; emulation prevention
+ * bytes are taken out before the fields are read. */
+static bool dv_rpu_is_profile5(const uint8_t *nal, size_t n)
+{
+    uint8_t buf[64];
+    size_t m = 0, zeros = 0;
+    for (size_t i = 3; i < n && m < sizeof(buf); i++) {
+        if (zeros >= 2 && nal[i] == 3) {
+            zeros = 0;
+            continue;
+        }
+        zeros = nal[i] == 0 ? zeros + 1 : 0;
+        buf[m++] = nal[i];
+    }
+    struct dv_bits b = { buf, m, 0 };
+    unsigned rpu_type = dv_read(&b, 6);
+    dv_read(&b, 11);                      /* rpu_format */
+    if (rpu_type != 2)
+        return false;
+    unsigned vdr_rpu_profile = dv_read(&b, 4);
+    dv_read(&b, 4);                       /* vdr_rpu_level */
+    if (!dv_read(&b, 1))                  /* vdr_seq_info_present_flag */
+        return false;
+    dv_read(&b, 1);                       /* chroma_resampling_explicit_filter_flag */
+    if (dv_read(&b, 2) == 0)              /* coefficient_data_type: fixed point has a denominator */
+        dv_read_ue(&b);
+    dv_read(&b, 2);                       /* vdr_rpu_normalized_idc */
+    unsigned bl_video_full_range_flag = dv_read(&b, 1);
+    return vdr_rpu_profile == 0 && bl_video_full_range_flag;
+}
+
+/* An Annex B HEVC access unit without the units the hardware decoder can't
+ * take (profile 7 remuxes in MKV arrive this way, enhancement layer and RPU
+ * included), filtered in place: start codes are kept as they are, so the
+ * result is never longer than the input. */
+static size_t hevc_base_layer(uint8_t *data, size_t size, bool *layer_seen)
+{
+    size_t out = 0, at = 0;
+    while (at + 3 <= size) {
+        size_t sc = at;
+        while (sc + 3 <= size && !(data[sc] == 0 && data[sc + 1] == 0 && data[sc + 2] == 1))
+            sc++;
+        if (sc + 3 > size)
+            break;
+        size_t nal = sc + 3, next = nal;
+        while (next + 3 <= size && !(data[next] == 0 && data[next + 1] == 0 && data[next + 2] == 1))
+            next++;
+        size_t end = next + 3 <= size ? next : size;
+        if (next + 3 <= size && end > nal && data[end - 1] == 0)
+            end--;   /* the leading zero of a 4-byte start code */
+        size_t start = sc > at && data[sc - 1] == 0 ? sc - 1 : sc;
+        bool skip = true;
+        if (end - nal >= 2) {
+            unsigned type = (data[nal] >> 1) & 0x3f;
+            unsigned layer = ((data[nal] & 1) << 5) | (data[nal + 1] >> 3);
+            if (layer != 0)
+                *layer_seen = true;
+            skip = type == 62 || type == 63 || layer != 0;
+        }
+        if (!skip) {
+            if (out != start)
+                memmove(data + out, data + start, end - start);
+            out += end - start;
+        }
+        at = end;
+    }
+    return out;
 }
 
 /* Length-prefixed NAL units -> Annex B, into dst (room for 4 + size per
@@ -479,6 +591,8 @@ static void read_headers(decoder_t *dec, decoder_sys_t *sys)
         if (sys->headers) {
             memcpy(sys->headers, p, n);
             sys->headers_size = n;
+            if (sys->codec == VDEC_CODEC_HEVC)   /* an enhancement layer's parameter sets, if any */
+                sys->headers_size = hevc_base_layer(sys->headers, n, &sys->dv_layer_seen);
         }
         return;
     }
@@ -841,9 +955,30 @@ static int Decode(decoder_t *dec, block_t *block)
     mtime_t pts = block->i_pts != VLC_TS_INVALID ? block->i_pts : block->i_dts;
     block_Release(block);
 
-    if (sys->codec == VDEC_CODEC_HEVC && hevc_has_rpu(au, size)) {
-        give_up(dec, "Dolby Vision requires the frame-metadata decoder");
-        return VLCDEC_SUCCESS;
+    if (sys->codec == VDEC_CODEC_HEVC) {
+        if (!sys->dv_profile) {
+            size_t rpu_len = 0;
+            const uint8_t *rpu = hevc_find_rpu(au, size, &rpu_len);
+            if (rpu)
+                sys->dv_profile = dv_rpu_is_profile5(rpu, rpu_len) ? 5 : 8;
+        }
+        if (sys->dv_profile == 5) {
+            give_up(dec, "Dolby Vision profile 5 requires the frame-metadata decoder");
+            return VLCDEC_SUCCESS;
+        }
+        if (sys->dv_profile) {
+            /* 7 or 8: the HDR10 base layer plays; the RPU and the enhancement layer are left out */
+            size = hevc_base_layer(au, size, &sys->dv_layer_seen);
+            if (sys->dv_layer_seen)
+                sys->dv_profile = 7;
+            if (sys->dv_profile != sys->dv_reported) {
+                sys->dv_reported = sys->dv_profile;
+                VLOG("Dolby Vision profile %u: the HDR10 base layer plays, RPU%s left out\n", sys->dv_profile,
+                     sys->dv_profile == 7 ? " and enhancement layer" : "");
+                if (vlc_ps5_vdec_dolby_vision)
+                    vlc_ps5_vdec_dolby_vision(sys->dv_profile);
+            }
+        }
     }
 
     /* After a seek or a stream error: nothing until a keyframe. VLC's MKV

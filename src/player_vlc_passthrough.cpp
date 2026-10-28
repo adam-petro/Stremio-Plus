@@ -1,5 +1,9 @@
 // PS5 HDMI passthrough adapted from EVO Player by sainsaji and contributors.
 // VLC output integration and bounded per-stream ownership added 2026-10-19.
+// Dolby TrueHD (Atmos included) over the system MAT port added 2026-10-28,
+// following the port modes and call order documented by sainsaji's
+// PS5-Audio-Passthrough-Research; a receiver showed "Dolby TrueHD 7.1" on
+// hardware with this route.
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define MODULE_NAME stremiops5audio
 #define MODULE_STRING "stremiops5audio"
@@ -23,6 +27,10 @@ int sceAudioOutOutput(int, const void*);
 int sceAudioOutExOpen(int, int);
 int sceAudioOutExClose(int);
 int sceAudioOutExConfigureOutput(int, unsigned, int, int, uint64_t);
+// The MAT (TrueHD) port is the system one: its own open, close and mode table.
+int sceAudioOutSysOpen(int, int);
+int sceAudioOutSysClose(int);
+int sceAudioOutSysConfigureOutput(int, unsigned, int, int, uint64_t);
 int sceAudioOutSysGetHdmiMonitorInfo(int, void*, unsigned);
 }
 
@@ -39,10 +47,15 @@ struct aout_sys_t {
     pt::Carrier carrier;
     pt::Packer packer{pt::Codec::unknown};
     std::vector<uint8_t> pending, burst;
+    // Whole port grains cut from the bursts; what is left over waits for the
+    // next burst (a MAT frame is 3.75 of the TrueHD port's grains).
+    std::vector<uint8_t> stream;
     // The last submitted grain may remain queued after Output returns. Keep
     // it separate from the packer's reusable vector until the next submission
     // has returned, and retain both buffers until an explicit native drain.
-    alignas(64) std::array<std::array<uint8_t, 4096>, 2> native_grains{};
+    // 16384 bytes: the TrueHD port's grain of 1024 16-byte frames; the stereo
+    // ports' 256 or 1024 4-byte frames fit in the same buffer.
+    alignas(64) std::array<std::array<uint8_t, 16384>, 2> native_grains{};
     unsigned next_grain = 0;
     int handle = -1;
     int first_native_error = 0;
@@ -64,6 +77,8 @@ pt::Codec codec_for(vlc_fourcc_t codec) {
         case VLC_CODEC_A52: return pt::Codec::ac3;
         case VLC_CODEC_EAC3: return pt::Codec::eac3;
         case VLC_CODEC_DTS: return pt::Codec::dts;
+        case VLC_CODEC_TRUEHD:
+        case VLC_CODEC_MLP: return pt::Codec::truehd;
         default: return pt::Codec::unknown;
     }
 }
@@ -72,12 +87,14 @@ const char* active_status(pt::Codec codec) {
         case pt::Codec::ac3: return "active_ac3";
         case pt::Codec::eac3: return "active_eac3";
         case pt::Codec::dts: return "active_dts_core";
+        case pt::Codec::truehd: return "active_truehd";
         default: return "pcm";
     }
 }
 bool sink_supports(pt::Codec codec) {
+    // CEA-861 short audio descriptor codes: AC-3 2, DTS 7, E-AC-3 10, MAT (TrueHD) 12.
     const int coding = codec == pt::Codec::ac3 ? 2 : codec == pt::Codec::eac3 ? 10 :
-        codec == pt::Codec::dts ? 7 : 0;
+        codec == pt::Codec::dts ? 7 : codec == pt::Codec::truehd ? 12 : 0;
     if (!coding) return false;
     std::array<uint8_t, 0x180> information{};
     if (sceAudioOutSysGetHdmiMonitorInfo(1, information.data(), unsigned(information.size())) < 0) return false;
@@ -154,7 +171,7 @@ bool close_port_locked(audio_output_t* output) {
     if (state.handle < 1) return true;
     if (!state.failed && null_bursts(output, 500) < 0) state.failed = true;
     if (!drain_port_locked(output)) return false;
-    const int closed = sceAudioOutExClose(state.handle);
+    const int closed = state.carrier.sys ? sceAudioOutSysClose(state.handle) : sceAudioOutExClose(state.handle);
     if (closed < 0) return shutdown_failure(output, "close", closed);
     state.handle = -1;
     state.configured = false;
@@ -163,7 +180,7 @@ bool close_port_locked(audio_output_t* output) {
     if (reset < 0) return shutdown_failure(output, "PCM restore", reset);
     last_hdmi_reset = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
-    state.pending.clear(); state.burst.clear(); state.next_pts = VLC_TICK_INVALID;
+    state.pending.clear(); state.burst.clear(); state.stream.clear(); state.next_pts = VLC_TICK_INVALID;
     hdmi_owner = nullptr;
     pcm_available.store(true, std::memory_order_release);
     notify(state, false, "pcm");
@@ -176,7 +193,7 @@ bool close_port(audio_output_t* output) {
 void stop(audio_output_t* output) {
     auto& state = *output->sys;
     if (!close_port(output)) return;
-    state.pending.clear(); state.burst.clear(); state.next_pts = VLC_TICK_INVALID;
+    state.pending.clear(); state.burst.clear(); state.stream.clear(); state.next_pts = VLC_TICK_INVALID;
 }
 int start(audio_output_t* output, audio_sample_format_t* format) {
     auto& state = *output->sys;
@@ -195,7 +212,7 @@ int start(audio_output_t* output, audio_sample_format_t* format) {
         }
         state.codec = codec; state.carrier = pt::carrier_for(codec); state.packer.set_codec(codec);
         state.failed = false; state.first_native_error = 0; state.next_pts = VLC_TICK_INVALID;
-        try { state.pending.reserve(maximum_pending); state.burst.reserve(24576); }
+        try { state.pending.reserve(maximum_pending); state.burst.reserve(65536); state.stream.reserve(81920); }
         catch (...) { notify(state, false, "pcm_allocation_failed"); return VLC_ENOMEM; }
         // Closing the ordinary SDL port happens through this callback before
         // HDMI switches mode, so a second PCM producer cannot overwrite it.
@@ -206,14 +223,17 @@ int start(audio_output_t* output, audio_sample_format_t* format) {
         // output instances; the HDMI mode belongs to the whole process.
         if (last_hdmi_reset != std::chrono::steady_clock::time_point{})
             std::this_thread::sleep_until(last_hdmi_reset + std::chrono::milliseconds(1000));
-        state.handle = sceAudioOutExOpen(0xff, state.carrier.mode);
+        state.handle = state.carrier.sys ? sceAudioOutSysOpen(0xff, state.carrier.mode)
+                                         : sceAudioOutExOpen(0xff, state.carrier.mode);
         if (state.handle < 1) {
             native_error(output, "open", state.handle);
             hdmi_owner = nullptr;
             pcm_available.store(true, std::memory_order_release);
             notify(state, false, "pcm_port_unavailable"); return VLC_EGENERIC;
         }
-        const int result = sceAudioOutExConfigureOutput(0, 0, state.carrier.mode, 1, 0);
+        // The system port's configure call takes the HDMI output type first.
+        const int result = state.carrier.sys ? sceAudioOutSysConfigureOutput(1, 0, state.carrier.mode, 1, 0)
+                                             : sceAudioOutExConfigureOutput(0, 0, state.carrier.mode, 1, 0);
         if (result < 0) {
             native_error(output, "configuration", result);
             if (close_port_locked(output)) notify(state, false, "pcm_configuration_failed");
@@ -247,19 +267,33 @@ bool output_bursts(audio_output_t* output, bool drain) {
         state.burst.clear();
         if (!state.packer.next_burst(state.pending, &cursor, &state.burst, &error, drain)) break;
         const size_t grain = size_t(state.carrier.grain_frames) * state.carrier.frame_bytes;
-        if (state.burst.empty() || state.burst.size() % grain != 0) return false;
+        if (state.burst.empty() || state.burst.size() % size_t(state.carrier.frame_bytes) != 0) return false;
         if (state.next_pts > VLC_TICK_INVALID) {
             const int64_t delay = state.next_pts - mdate();
             if (delay > 2000000) return false;
             if (delay > 0) std::this_thread::sleep_for(std::chrono::microseconds(delay));
         }
-        for (size_t offset = 0; offset < state.burst.size(); offset += grain)
-            if (submit_grain(output, state.burst.data() + offset) < 0) return false;
+        // Whole grains go out now; a burst that is not a whole number of
+        // grains (a MAT frame) leaves its tail for the next burst.
+        state.stream.insert(state.stream.end(), state.burst.begin(), state.burst.end());
+        size_t sent = 0;
+        for (; sent + grain <= state.stream.size(); sent += grain)
+            if (submit_grain(output, state.stream.data() + sent) < 0) return false;
+        state.stream.erase(state.stream.begin(), state.stream.begin() + sent);
         if (state.next_pts > VLC_TICK_INVALID)
             state.next_pts += int64_t(state.burst.size()) * CLOCK_FREQ /
                 (int64_t(state.carrier.frame_rate()) * state.carrier.frame_bytes);
     }
     if (cursor) state.pending.erase(state.pending.begin(), state.pending.begin() + cursor);
+    if (drain && !error && !state.stream.empty()) {
+        // The end of the stream: the tail goes out in a grain padded with
+        // zeros, which the receiver takes as the pause between bursts.
+        const size_t grain = size_t(state.carrier.grain_frames) * state.carrier.frame_bytes;
+        state.stream.resize(grain, 0);
+        const bool sent = submit_grain(output, state.stream.data()) >= 0;
+        state.stream.clear();
+        if (!sent) return false;
+    }
     return !error;
 }
 void play(audio_output_t* output, block_t* block) {
@@ -289,7 +323,7 @@ void pause(audio_output_t* output, bool paused, vlc_tick_t date) {
     auto& state = *output->sys;
     if (state.codec != pt::Codec::unknown) {
         if (paused && !drain_port(output)) return;
-        state.pending.clear(); state.next_pts = VLC_TICK_INVALID;
+        state.pending.clear(); state.stream.clear(); state.next_pts = VLC_TICK_INVALID;
         return;
     }
     auto callback = paused ? state.pause : state.resume;
@@ -304,7 +338,7 @@ void flush(audio_output_t* output, bool wait) {
             if (!okay) { state.failed = true; notify(state, false, "output_failed"); }
         }
         if (!drain_port(output)) return;
-        state.pending.clear(); state.burst.clear(); state.next_pts = VLC_TICK_INVALID;
+        state.pending.clear(); state.burst.clear(); state.stream.clear(); state.next_pts = VLC_TICK_INVALID;
     } else if (wait) { if (state.drain) state.drain(state.opaque); }
     else if (state.flush) state.flush(state.opaque, mdate());
 }

@@ -55,8 +55,19 @@ PS5 modules supply hardware decoding for supported H.264, HEVC, and 8-bit
 VP9 profile 0 streams. FFmpeg 8.1.2 and dav1d provide software decoding for
 other supported formats.
 The app follows the PS5's output resolution, with 1080p, 1440p, and 4K options.
+
+**Audio to your receiver.** Settings → Audio passthrough sends Dolby
+Digital, Dolby Digital Plus, DTS and Dolby TrueHD (Atmos included) to the
+HDMI receiver as the original bitstream, so the receiver decodes them; the
+console's HDMI output switches to the format for the track and returns to
+PCM afterwards. A format the receiver does not list, and any other track,
+plays as PCM.
 Compatibility depends on the stream's profile and container. The OpenGL
-presentation path outputs SDR, with HDR10 sources tone-mapped for display.
+presentation path draws SDR, and switches the console's scan-out to HDR10
+while an HDR10 or HLG video plays on a display whose link runs in HDR
+(Settings → HDR output; the PS5 setting HDR must be On When Supported). Dolby
+Vision profile 7 and 8 files play their HDR10 base layer on the hardware
+decoder; profile 5 is reshaped by the software decoder and shown in SDR.
 Playback controls appear when the first video frame reaches the GPU. If audio
 starts without a video picture, the player retries the same source once using
 software decoding, preserving the selected download and starting position.
@@ -375,6 +386,11 @@ version, the steps that triggered it, and these files:
 - `log.txt`
 - `runtime.json`
 - `crash-current.txt` and `crash-last.txt`, if present
+
+Settings → Diagnostics server publishes the same files over plain HTTP on
+port 9029 for a computer on the same network: `/log` (add `?follow=1` to
+stream it), `/events`, `/status`, `/crash` and `/boot`. It is off by default
+and has no authentication, so use it on a home network only.
 
 For download problems, include when the slowdown started and whether a video
 was playing at the time. Checkpoint failures record the operation that failed
